@@ -139,6 +139,9 @@ def train_predictor(
             with tune.checkpoint_dir(best_epoch) as checkpoint_dir:
                 path = os.path.join(checkpoint_dir, 'checkpoint')
                 torch.save(best_state_dict, path)
+                path = os.path.join(checkpoint_dir, 'vl_loss.json')
+                with open(path, 'w') as fp:
+                    json.dump(losses, fp, indent=2, sort_keys=True)
 
         # check for convergence
         if (current_epoch - best_epoch > 1000):
@@ -150,8 +153,10 @@ def train_predictor(
 
     # save the model parameters to the local results folders
     if output_dir:
-        torch.save(best_state_dict, os.path.join(output_dir, 'checkpoint'))
-        with open(os.path.join(output_dir, 'vl_loss.json'), 'w') as fp:
+        path = os.path.join(output_dir, 'checkpoint')
+        torch.save(best_state_dict, path)
+        path = os.path.join(output_dir, 'vl_loss.json')
+        with open(path, 'w') as fp:
             json.dump(losses, fp, indent=2, sort_keys=True)
 
     # return the trial dictionary
