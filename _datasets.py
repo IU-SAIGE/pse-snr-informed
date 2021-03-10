@@ -1,5 +1,5 @@
 import os
-from typing import List, Optional, Set, Tuple, Union
+from typing import Optional, Sequence, Tuple, Union
 
 import numpy as np
 import pandas as pd
@@ -18,6 +18,8 @@ _df_types = dict(
     is_sparse=bool, set_id=str, speaker_id=str, utterance_id=str,
     freesound_id=str,
 )
+
+EPS = 1e-30
 
 
 def create_df_librispeech(
@@ -69,6 +71,8 @@ def create_df_musan(
         root_directory + '/' + df.data_type + '/' + df.set_id + '/'
         + df.data_type + '-' + df.set_id + '-' + df.clip_id + '.wav'
     )
+    df.loc[:, 'split'] = df.set_id
+    df.split = df.split.replace({'free-sound': 'train', 'sound-bible': 'test'})
     assert all(df.filepath.apply(os.path.isfile))
     return df
 
@@ -120,209 +124,205 @@ def segmental_snr(
     w = np.hanning(segment_size)    # window
 
     seg_snrs = []
-    eps = 1e-30
 
     for i in range(0, s.shape[-1]-segment_size, hop_length):
         s_i = s[..., i:i+segment_size] * w
         r_i = r[..., i:i+segment_size] * w
-        s_i = (s_i**2).sum(axis=-1) + eps
-        r_i = (r_i**2).sum(axis=-1) + eps
+        s_i = (s_i**2).sum(axis=-1) + EPS
+        r_i = (r_i**2).sum(axis=-1) + EPS
         snr_i = 10*np.log10(s_i/r_i)
         seg_snrs.append(snr_i)
 
     return np.stack(seg_snrs).T
 
 
-## experiment dataloaders
-
-class SpeakerAgnosticMixtures(IterableDataset):
+class Mixtures(IterableDataset):
 
     def __init__(
         self,
-        speaker_ids: Union[List[str], Set[str]],
-        utterance_duration: Optional[float] = 1.,  # seconds
-        mixture_snr: Union[float, Tuple[float, float]] = (-5., 10.),  # dB
-        seg_snrs: bool = False
+        speaker_ids: Sequence[str],
+        premixture_set: Optional[str] = None,
+        premixture_snr: Optional[Union[float, Tuple[float, float]]] = None,
+        mixture_set: Optional[str] = None,
+        mixture_snr: Optional[Union[float, Tuple[float, float]]] = None,
+        dataset_duration: Optional[float] = None,
+        utterance_duration: float = 1.,
+        target_snrs: bool = False,
     ):
-        self.rng = np.random.default_rng(0)
-        (self.s_idx, self.n_idx) = (-1, -1)
+        # parse and sanity check arguments
+        self.sanity_check(locals())
 
-        self.speaker_ids = speaker_ids
-        if isinstance(mixture_snr, Tuple):
-            self.mixture_snr_min = min(mixture_snr)
-            self.mixture_snr_max = max(mixture_snr)
-        else:
-            self.mixture_snr_min = self.mixture_snr_max = mixture_snr
-        self.df_s = librispeech.query(f'speaker_id in {speaker_ids}')
-        self.df_n = fsd50k.query(f'split == "train"')
-        self.utterance_duration = utterance_duration
-        self.seg_snrs = seg_snrs
+        # setup internal corpora
+        self.df_s = librispeech.query(f'speaker_id in {self.speaker_ids}')
+        self.df_m = fsd50k.query(f'split == "{self.premixture_set}"')
+        self.df_n = musan.query(f'split == "{self.mixture_set}"')
+
+        # setup corpora pointers
+        self.reset()
+
+        # if dealing with a single-speaker, load all the audio data in advance
+        self.speech = []
+        if len(self.speaker_ids) == 1:
+
+            for filepath in self.df_s.filepath.tolist():
+                (_, s) = wavfile.read(filepath)
+                self.speech.append(s)
+            self.speech = np.concatenate(self.speech)
+
+            # truncate the corpus if specified
+            if dataset_duration:
+                num_samples_dataset = int(dataset_duration * sample_rate)
+                self.speech = self.speech[:num_samples_dataset]
+
+            # normalize
+            self.speech = self.speech / (self.speech.std() + EPS)
 
     def __iter__(self):
         return self
 
     def reset(self):
         self.rng = np.random.default_rng(0)
-        (self.s_idx, self.n_idx) = (-1, -1)
+        (self.s_idx, self.m_idx, self.n_idx) = (-1, -1, -1)
 
-    def __next__(self):
+    def sanity_check(self, args: dict):
 
-        # increment pointers
-        self.s_idx = (self.s_idx + 1) % len(self.df_s)
-        self.n_idx = (self.n_idx + 1) % len(self.df_n)
+        # verify speaker ID(s)
+        if not isinstance(args['speaker_ids'], (list, set)):
+            raise ValueError('Expected a list or set of speaker IDs.')
+        if len(args['speaker_ids']) < 1:
+            raise ValueError('Expected one or more speaker IDs.')
+        if not set(args['speaker_ids']).issubset(set(librispeech.speaker_id)):
+            raise ValueError('Invalid speaker IDs, must be within LibriSpeech.')
+        self.speaker_ids = args['speaker_ids']
 
-        length = int(self.utterance_duration * sample_rate)
-        offset_s = self.df_s.max_offset.iloc[self.s_idx]
-        offset_n = self.df_n.max_offset.iloc[self.n_idx]
-        if offset_s > 0:
-            offset_s = self.rng.integers(0, offset_s)
-        if offset_n > 0:
-            offset_n = self.rng.integers(0, offset_n)
-
-        # read speech file, offset and truncate, then normalize
-        (_, s) = wavfile.read(self.df_s.filepath.iloc[self.s_idx])
-        s = s[offset_s:offset_s+length]
-        s = s / (1e-8 + s.std())
-
-        # read noise file, offset and truncate, then normalize
-        (_, n) = wavfile.read(self.df_n.filepath.iloc[self.n_idx])
-        n = n[offset_n:offset_n+length]
-        n = n / (1e-8 + n.std())
-
-        # mix the signals
-        snr = self.rng.uniform(self.mixture_snr_min, self.mixture_snr_max)
-        x = s + (n * 10**(-snr/20.))
-
-        # create output tuple
-        scale_factor = 1e-8 + max(abs(x.min()), abs(x.max()))
-
-        if self.seg_snrs:
-            sample = (
-                torch.Tensor(x) / scale_factor,
-                torch.Tensor(segmental_snr(estimate=x, target=s))
-            )
-        else:
-            sample = (
-                torch.Tensor(x) / scale_factor,
-                torch.Tensor(s) / scale_factor,
-                torch.Tensor(n) / scale_factor,
-            )
-
-        return sample
-
-
-class SpeakerSpecificMixtures(IterableDataset):
-
-    def __init__(
-            self,
-            speaker_id: str,
-            speech_subset: str,
-            noise_subset: str = 'free-sound',
-            dataset_duration: Optional[int] = None,
-            utterance_duration: Optional[int] = 1,
-            premixture_snr: Optional[Union[float, Tuple[float, float]]] = None,
-            mixture_snr: Union[float, Tuple[float, float]] = (-5, 5)
-    ):
-        # sanity check for inputs
-        if noise_subset not in musan.set_id.unique():
-            raise ValueError(f'Invalid noise subset \'{noise_subset}\'. '
-                             f'Allowed values: {set(musan.set_id.unique())}.')
-        if speech_subset not in librispeech.partition.unique():
-            raise ValueError(f'Invalid speech subset \'{speech_subset}\'. '
-                             f'Allowed values: '
-                             f'{set(librispeech.partition.unique())}.')
-        if speaker_id not in librispeech.speaker_id.unique():
-            raise ValueError(f'Invalid LibriSpeech speaker ID \'{speaker_id}\'.')
-
-        self.speaker_id = speaker_id
-        self.speech_subset = speech_subset
-        self.rng = np.random.default_rng(0)
-        self.m_idx = -1
-        self.n_idx = -1
+        # missing pairs of arguments
+        if args['premixture_set'] != None and args['premixture_snr'] == None:
+            raise ValueError('Missing argument `premixture_snr`.')
+        if args['premixture_set'] == None and args['premixture_snr'] != None:
+            raise ValueError('Missing argument `premixture_set`.')
+        if args['mixture_set'] != None and args['mixture_snr'] == None:
+            raise ValueError('Missing argument `mixture_snr`.')
+        if args['mixture_set'] == None and args['mixture_snr'] != None:
+            raise ValueError('Missing argument `mixture_set`.')
 
         # unpack mixture SNR values
-        if isinstance(mixture_snr, Tuple):
-            self.mixture_snr_min = min(mixture_snr)
-            self.mixture_snr_max = max(mixture_snr)
+        if isinstance(args['premixture_snr'], tuple):
+            self.premixture_snr_min = float(min(args['premixture_snr']))
+            self.premixture_snr_max = float(max(args['premixture_snr']))
+        elif isinstance(args['premixture_snr'], (float, int)):
+            self.premixture_snr_min = float(args['premixture_snr'])
+            self.premixture_snr_max = float(args['premixture_snr'])
+        elif args['premixture_snr'] is None:
+            self.premixture_snr_min = None
+            self.premixture_snr_max = None
         else:
-            self.mixture_snr_min = self.mixture_snr_max = mixture_snr
-        if isinstance(premixture_snr, Tuple):
-            self.premixture_snr_min = min(premixture_snr)
-            self.premixture_snr_max = max(premixture_snr)
+            raise ValueError('Expected `premixture_snr` to be a float type or '
+                             'a tuple of floats.')
+        if isinstance(args['mixture_snr'], tuple):
+            self.mixture_snr_min = float(min(args['mixture_snr']))
+            self.mixture_snr_max = float(max(args['mixture_snr']))
+        elif isinstance(args['mixture_snr'], (float, int)):
+            self.mixture_snr_min = float(args['mixture_snr'])
+            self.mixture_snr_max = float(args['mixture_snr'])
+        elif args['mixture_snr'] is None:
+            self.mixture_snr_min = None
+            self.mixture_snr_max = None
         else:
-            self.premixture_snr_min = self.premixture_snr_max = premixture_snr
+            raise ValueError('Expected `mixture_snr` to be a float type or '
+                             'a tuple of floats.')
 
-        # load internal corpora
-        self.df_s = librispeech.query(f'speaker_id == "{speaker_id}" and ' +
-                                      f'partition == "{speech_subset}"')
-        self.df_m = demand
-        self.df_n = musan.query(f'set_id == "{noise_subset}"')
+        # verify corpus sets
+        if args['premixture_snr'] is not None:
+            if not (args['premixture_set'] in ('train', 'val', 'test')):
+                raise ValueError('Expected `premixture_set` to be '
+                                 '"train", "val", or "test".')
+        if args['mixture_snr'] is not None:
+            if args['mixture_set'] == 'free-sound':
+                args['mixture_set'] = 'train'
+            elif args['mixture_set'] == 'sound-bible':
+                args['mixture_set'] = 'test'
+            elif not (args['mixture_set'] in ('train', 'test')):
+                raise ValueError('Expected `mixture_set` to be '
+                                 '"train" or "test".')
+        self.premixture_set = args['premixture_set'] or ''
+        self.mixture_set = args['mixture_set'] or ''
 
-        # pre-load speech data
-        self.speech = []
-        for filepath in self.df_s.filepath.tolist():
-            (_, s) = wavfile.read(filepath)
-            self.speech.append(s)
-        self.speech = np.concatenate(self.speech)
-        if dataset_duration:
-            self.speech = self.speech[:(dataset_duration * sample_rate)]
-        self.speech = self.speech / (1e-8 + self.speech.std())
-        self.utterance_duration = utterance_duration
-        self.max_offset = len(self.speech) - (utterance_duration * sample_rate)
+        # verify target specification
+        if not isinstance(args['target_snrs'], bool):
+            raise ValueError('Expected `target_snrs` to be True or False.')
+        self.target_snrs = args['target_snrs']
 
-    def __iter__(self):
-        return self
+        # verify utterance duration
+        if not isinstance(args['utterance_duration'], (int, float)):
+            raise ValueError('Expected `utterance_duration` to be a number.')
+        self.utterance_duration = args['utterance_duration']
 
-    def reset(self):
-        self.rng = np.random.default_rng(0)
-        self.m_idx = -1
-        self.n_idx = -1
+        # verify dataset duration
+        if not isinstance(args['dataset_duration'], (int, float, type(None))):
+            raise ValueError('Expected `dataset_duration` to be a number.')
+        self.dataset_duration = args['dataset_duration']
 
     def __next__(self):
 
-        # increment pointers
-        self.m_idx = (self.m_idx + 1) % len(self.df_m)
-        self.n_idx = (self.n_idx + 1) % len(self.df_n)
+        length = int(self.utterance_duration * sample_rate)
 
-        length = self.utterance_duration * sample_rate
-        offset_s = 0
-        if self.max_offset > 0:
-            offset_s = self.rng.integers(0, self.max_offset)
-        offset_m = self.rng.integers(0, self.df_m.max_offset.iloc[self.m_idx])
-        offset_n = self.rng.integers(0, self.df_n.max_offset.iloc[self.n_idx])
+        # slice from speech array, randomly offset, truncate, normalize, and mix
+        s: np.ndarray = np.zeros(length)
+        if len(self.speaker_ids) > 1:
+            self.s_idx = (self.s_idx + 1) % len(self.df_s)
+            offset_s = self.df_s.max_offset.iloc[self.s_idx]
+            (_, _s) = wavfile.read(self.df_s.filepath.iloc[self.s_idx])
+            s = _s[offset_s:offset_s+length]
+        else:
+            offset_s = max(1, len(self.speech) - length)
+            offset_s = self.rng.integers(0, offset_s)
+            s = self.speech[offset_s:offset_s+length]
+        s = s / (EPS + s.std())
+        x = p = s
 
-        # slice from speech array, offset and truncate, then normalize
-        s = self.speech[offset_s:offset_s+length]
-        s = s / (1e-8 + s.std())
-        p = s
-
-        # add premixture
-        if self.premixture_snr_min is not None:
+        # read premixture noise, randomly offset, truncate, normalize, and mix
+        m: np.ndarray = np.zeros(length)
+        if len(self.df_m) > 0:
+            self.m_idx = (self.m_idx + 1) % len(self.df_m)
+            offset_m = max(1, self.df_m.max_offset.iloc[self.m_idx])
+            offset_m = self.rng.integers(0, offset_m)
             (_, m) = wavfile.read(self.df_m.filepath.iloc[self.m_idx])
             m = m[offset_m:offset_m+length]
-            m = m / (1e-8 + m.std())
+            m = m / (EPS + m.std())
             snr = self.rng.uniform(self.premixture_snr_min,
                                    self.premixture_snr_max)
             p = s + (m * 10 ** (-snr / 20.))
+            x = p
 
-        # read noise file, offset and truncate, then normalize
-        (_, n) = wavfile.read(self.df_n.filepath.iloc[self.n_idx])
-        n = n[offset_n:offset_n+length]
-        n = n / (1e-8 + n.std())
-
-        # mix the signals
-        snr = self.rng.uniform(self.mixture_snr_min, self.mixture_snr_max)
-        x = p + (n * 10 ** (-snr / 20.))
+        # read deformation noise, randomly offset, truncate, normalize, and mix
+        n: np.ndarray = np.zeros(length)
+        if len(self.df_n) > 0:
+            self.n_idx = (self.n_idx + 1) % len(self.df_n)
+            offset_n = max(1, self.df_m.max_offset.iloc[self.n_idx])
+            offset_n = self.rng.integers(0, offset_n)
+            (_, n) = wavfile.read(self.df_n.filepath.iloc[self.n_idx])
+            n = n[offset_n:offset_n+length]
+            n = n / (EPS + n.std())
+            snr = self.rng.uniform(self.mixture_snr_min,
+                                   self.mixture_snr_max)
+            x = p + (n * 10 ** (-snr / 20.))
 
         # create output tuple
-        scale_factor = 1e-8 + max(abs(x.min()), abs(x.max()))
-        sample = (
-            torch.Tensor(x) / scale_factor,  # noise-injected premixture
-            torch.Tensor(p) / scale_factor,  # premixture (or clean speech)
-            torch.Tensor(n) / scale_factor,  # added noise
-        )
-
+        sample = ()
+        scale_factor = EPS + max(abs(x.min()), abs(x.max()))
+        if self.target_snrs:
+            sample = (
+                torch.Tensor(x) / scale_factor,     # noise-injected premixture
+                torch.Tensor(segmental_snr(x, s)),  # frame-by-frame SNRs
+            )
+        else:
+            sample = (
+                torch.Tensor(x) / scale_factor,  # noise-injected premixture
+                torch.Tensor(p) / scale_factor,  # premixture (or clean speech)
+            )
         return sample
+
+    # end of class
 
 
 _sf = ('_8khz' if sample_rate == 8000 else '')

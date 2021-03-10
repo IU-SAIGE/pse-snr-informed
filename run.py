@@ -30,31 +30,6 @@ torch.backends.cudnn.benchmark = False
 ROOT = os.path.dirname(os.path.realpath(__file__))
 
 
-def instantiate_denoiser(
-    model_choice: int,
-    learning_rate: float,
-):
-    # select device
-    device = 'cpu'
-    if torch.cuda.is_available():
-        device = 'cuda:0'
-
-    model: torch.nn.Module
-    if model_choice == 0:
-        model = M.DenoiserGRU(64, 2)
-    elif model_choice == 1:
-        model = M.DenoiserGRU(128, 2)
-    elif model_choice == 2:
-        model = M.DenoiserGRU(256, 2)
-    elif model_choice == 3:
-        model = M.DenoiserCTN()
-    else:
-        raise ValueError('Invalid model choice.')
-    model = model.to(device)
-    optimizer = torch.optim.Adam(params=model.parameters(), lr=learning_rate)
-    return (model, optimizer)
-
-
 def train_predictor(
     hidden_size: int,
     num_layers: int,
@@ -71,14 +46,8 @@ def train_predictor(
     # create local output directory
     output_dir: str = ''
     if save_to_local:
-        if config['pretrain_type'] == 1:
-            output_dir = os.path.join(ROOT, 'weights_pt', config['model_name'],
-                                  'multispeaker')
-        elif config['pretrain_type'] == 2:
-            output_dir = os.path.join(ROOT, 'weights_pt', config['model_name'],
-                                  'pseudose',
-                                  'pm{:02d}'.format(config['premixture_snr']),
-                                  config['speaker_id'])
+        output_dir = os.path.join(ROOT, 'weights', 'snr_predictor',
+                                  f'{num_layers}x{hidden_size:04d}')
         pathlib.Path(output_dir).mkdir(0o777, True, True)
         print('[INFO] Will copy results to {}.'.format(output_dir))
         if os.path.exists(os.path.join(output_dir, 'checkpoint')):
@@ -108,11 +77,21 @@ def train_predictor(
 
     # setup training dataloader
     train_dataloader = DataLoader(
-        D.SpeakerAgnosticMixtures(D.speaker_ids_tr, seg_snrs=True), batch_size)
+        D.Mixtures(
+            speaker_ids=D.speaker_ids_tr,
+            premixture_set='train',
+            premixture_snr=mixture_snr,
+            target_snrs=True
+        ), batch_size)
 
     # prepare validation set
     val_dataloader = DataLoader(
-        D.SpeakerAgnosticMixtures(D.speaker_ids_vl, seg_snrs=True), 100)
+        D.Mixtures(
+            speaker_ids=D.speaker_ids_vl,
+            premixture_set='val',
+            premixture_snr=mixture_snr,
+            target_snrs=True
+        ), 100)
     (vl_x, vl_snrs) = next(iter(val_dataloader))
     vl_x = vl_x.to(device)
     vl_snrs = vl_snrs.to(device)
@@ -172,7 +151,7 @@ def train_predictor(
     # save the model parameters to the local results folders
     if output_dir:
         torch.save(best_state_dict, os.path.join(output_dir, 'checkpoint'))
-        with open(os.path.join(output_dir, 'validation_loss.json'), 'w') as fp:
+        with open(os.path.join(output_dir, 'vl_loss.json'), 'w') as fp:
             json.dump(losses, fp, indent=2, sort_keys=True)
 
     # return the trial dictionary
@@ -202,7 +181,7 @@ def ray_tune_predictor(
     config = {
         'hidden_size': tune.grid_search([64, 128, 256, 512, 1024]),
         'num_layers': tune.grid_search([2, 3]),
-        'learning_rate': tune.loguniform(1e-4, 1e-1),
+        'learning_rate': tune.grid_search([1e-4, 1e-3, 1e-2, 1e-1]),
         'batch_size': 128,
         'mixture_snr': (-10., 10.),
         'save_to_local': False
@@ -219,12 +198,12 @@ def ray_tune_predictor(
     # use Tune to queue up trials in parallel on the GPUs
     tune.run(
         _ray_tune_predictor,
-        resources_per_trial={'gpu': num_gpus},
         config=config,
-        log_to_file='log.txt',
         keep_checkpoints_num=1,
-        num_samples=10,
+        log_to_file='log.txt',
         queue_trials=True,
+        resources_per_trial={'gpu': num_gpus},
+        verbose=1
     )
 
     print('Finished `ray_tune_predictor(' +
