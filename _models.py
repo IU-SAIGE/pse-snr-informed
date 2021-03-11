@@ -2,22 +2,25 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from asteroid.losses.mse import SingleSrcMSE
 from asteroid.losses.sdr import SingleSrcNegSDR
 from asteroid.losses.stoi import NegSTOILoss as SingleSrcNegSTOI
 from asteroid.models.conv_tasnet import ConvTasNet
+from torch.nn.modules.loss import _Loss
+
+
+EPS = 1e-30
 
 
 class PredictorGRU(nn.Module):
 
-    # STFT parameters
-    fft_size: int = 1024
-    hop_length: int = 256
-
     def __init__(self, hidden_size: int, num_layers: int = 2):
         super().__init__()
-        self.hidden_size = hidden_size
-        self.num_layers = num_layers
+        self.hidden_size: int = hidden_size
+        self.num_layers: int = num_layers
+        self.fft_size: int = 1024
+        self.hop_length: int = 256
 
         # layers
         self.rnn = nn.GRU(
@@ -35,9 +38,9 @@ class PredictorGRU(nn.Module):
                      f'_{hidden_size:04d}x{num_layers:02d}')
 
     def stft(
-    	self,
-    	waveform: torch.Tensor
-	):
+        self,
+        waveform: torch.Tensor
+    ):
         """Calculates the Short-time Fourier transform (STFT)."""
 
         # perform the short-time Fourier transform
@@ -64,14 +67,13 @@ class PredictorGRU(nn.Module):
 
 
 class DenoiserGRU(nn.Module):
-    # STFT parameters
-    fft_size: int = 1024
-    hop_length: int = 256
 
     def __init__(self, hidden_size: int, num_layers: int = 2):
         super().__init__()
-        self.hidden_size = hidden_size
-        self.num_layers = num_layers
+        self.hidden_size: int = hidden_size
+        self.num_layers: int = num_layers
+        self.fft_size: int = 1024
+        self.hop_length: int = 256
 
         # create a neural network which predicts a TF binary ratio mask
         self.encoder = nn.GRU(
@@ -92,9 +94,9 @@ class DenoiserGRU(nn.Module):
                      f'_{hidden_size:04d}x{num_layers:02d}')
 
     def stft(
-    	self,
-    	waveform: torch.Tensor
-	):
+        self,
+        waveform: torch.Tensor
+    ):
         """Calculates the Short-time Fourier transform (STFT)."""
 
         # perform the short-time Fourier transform
@@ -113,10 +115,10 @@ class DenoiserGRU(nn.Module):
         return spectrogram, magnitude_spectrogram
 
     def istft(
-    	self,
-    	spectrogram: torch.Tensor,
-    	mask: Optional[torch.Tensor] = None
-	):
+        self,
+        spectrogram: torch.Tensor,
+        mask: Optional[torch.Tensor] = None
+    ):
         """Calculates the inverse Short-time Fourier transform (ISTFT)."""
 
         # apply a time-frequency mask if provided
@@ -172,3 +174,141 @@ class DenoiserCTN(nn.Module):
         denoised = output[..., 0, :]
         residual = output[..., 1, :]
         return denoised, residual
+
+
+class SDRLoss(_Loss):
+    '''Loss function based on SI-SDR.'''
+
+    def __init__(
+        self,
+        sdr_type: str = 'sisdr',
+        reduction: str = 'none'
+    ):
+        super().__init__(reduction=reduction)
+        assert sdr_type in ('snr', 'sisdr', 'sdsdr')
+        self.sdr_type = sdr_type
+
+    def forward(self, estimate, target):
+        assert target.size() == estimate.size()
+
+        # subtract signal means
+        mean_source = torch.mean(target, dim=1, keepdim=True)
+        mean_estimate = torch.mean(estimate, dim=1, keepdim=True)
+        target = target - mean_source
+        estimate = estimate - mean_estimate
+
+        # SDR numerator
+        if self.sdr_type != 'snr':
+            dot = torch.sum(estimate * target, dim=1, keepdim=True)
+            s_target_energy = torch.sum(target ** 2, dim=1, keepdim=True) + EPS
+            scaled_target = dot * target / s_target_energy
+        else:
+            scaled_target = target
+
+        # SDR denominator
+        if self.sdr_type != 'sisdr':
+            e_noise = estimate - target
+        else:
+            e_noise = estimate - scaled_target
+
+        losses = torch.sum(scaled_target ** 2, dim=1)
+        losses = losses / (torch.sum(e_noise ** 2, dim=1) + EPS)
+        losses = 10 * torch.log10(losses + EPS)
+        losses = losses.mean() if self.reduction == 'mean' else losses
+
+        return -losses
+
+
+class SegSDRLoss(_Loss):
+    '''Loss function based on SI-SDR segmented frame by frame.'''
+
+    def __init__(
+        self,
+        sdr_type: str = 'sisdr',
+        reduction: str = 'none',
+        segment_size: int = 1024,
+        hop_length: int = 256,
+        center: bool = True,
+        pad_mode: str = 'reflect'
+    ):
+        super().__init__(reduction=reduction)
+        assert sdr_type in ('snr', 'sisdr', 'sdsdr')
+        assert pad_mode in ('constant', 'reflect')
+        assert isinstance(center, bool)
+        assert segment_size > hop_length > 0
+
+        self.sdr_type = sdr_type
+        self.segment_size = segment_size
+        self.hop_length = hop_length
+        self.center = center
+        self.pad_mode = pad_mode
+        self.window = torch.hann_window(self.segment_size).view(1, 1, -1)
+
+    def forward(self, estimate, target, weights=None):
+        assert target.size() == estimate.size()
+        assert target.ndim == 2
+        assert self.segment_size < target.size()[-1]
+
+        # subtract signal means
+        mean_source = torch.mean(target, dim=1, keepdim=True)
+        mean_estimate = torch.mean(estimate, dim=1, keepdim=True)
+        target = target - mean_source
+        estimate = estimate - mean_estimate
+
+        if self.center:
+            signal_dim = target.dim()
+            ext_shape = [1] * (3 - signal_dim) + list(target.size())
+            p = int(self.segment_size // 2)
+            target = F.pad(target.view(ext_shape), [p, p], self.pad_mode)
+            target = target.view(target.shape[-signal_dim:])
+            estimate = F.pad(estimate.view(ext_shape), [p, p], self.pad_mode)
+            estimate = estimate.view(estimate.shape[-signal_dim:])
+
+        # use stride tricks to construct overlapping frames out of inputs
+        (n_batch, n_samples) = target.size()
+        n_frames = (n_samples - self.segment_size) // self.hop_length + 1
+        target = torch.as_strided(
+            target,
+            size=(n_batch, n_frames, self.segment_size),
+            stride=(n_samples, self.hop_length, 1))
+        estimate = torch.as_strided(
+            estimate,
+            size=(n_batch, n_frames, self.segment_size),
+            stride=(n_samples, self.hop_length, 1))
+
+        # window all the frames
+        target *= self.window
+        estimate *= self.window
+
+        # apply weighting (if provided)
+        if weights is not None:
+            assert weights.numel() == n_frames
+            weights = weights.view(1, -1, 1)
+            target *= weights
+            estimate *= weights
+
+        # collapse batch and time axes
+        target = target.reshape(-1, self.segment_size)
+        estimate = estimate.reshape(-1, self.segment_size)
+
+        # SDR numerator
+        if self.sdr_type != 'snr':
+            dot = torch.sum(estimate * target, dim=1, keepdim=True)
+            s_target_energy = torch.sum(target ** 2, dim=1, keepdim=True) + EPS
+            scaled_target = dot * target / s_target_energy
+        else:
+            scaled_target = target
+
+        # SDR denominator
+        if self.sdr_type != 'sisdr':
+            e_noise = estimate - target
+        else:
+            e_noise = estimate - scaled_target
+
+        losses = torch.sum(scaled_target ** 2, dim=1)
+        losses = losses / (torch.sum(e_noise ** 2, dim=1) + EPS)
+        losses = 10 * torch.log10(losses + EPS)
+        losses = losses.view(n_batch, -1)
+        losses = losses.mean() if self.reduction == 'mean' else losses
+
+        return -losses
