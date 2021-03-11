@@ -79,6 +79,7 @@ def train_predictor(
     train_dataloader = DataLoader(
         D.Mixtures(
             speaker_ids=D.speaker_ids_tr,
+            utterance_split='all',
             premixture_set='train',
             premixture_snr=mixture_snr,
         ), batch_size)
@@ -87,6 +88,7 @@ def train_predictor(
     val_dataloader = DataLoader(
         D.Mixtures(
             speaker_ids=D.speaker_ids_vl,
+            utterance_split='all',
             premixture_set='val',
             premixture_snr=mixture_snr,
         ), 100)
