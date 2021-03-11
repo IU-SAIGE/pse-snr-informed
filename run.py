@@ -81,7 +81,6 @@ def train_predictor(
             speaker_ids=D.speaker_ids_tr,
             premixture_set='train',
             premixture_snr=mixture_snr,
-            target_snrs=True
         ), batch_size)
 
     # prepare validation set
@@ -90,9 +89,8 @@ def train_predictor(
             speaker_ids=D.speaker_ids_vl,
             premixture_set='val',
             premixture_snr=mixture_snr,
-            target_snrs=True
         ), 100)
-    (vl_x, vl_snrs) = next(iter(val_dataloader))
+    (vl_x, _, vl_snrs) = next(iter(val_dataloader))
     vl_x = vl_x.to(device)
     vl_snrs = vl_snrs.to(device)
 
@@ -100,7 +98,7 @@ def train_predictor(
     # begin training loop
     #
 
-    for (tr_x, tr_snrs) in train_dataloader:
+    for (tr_x, _, tr_snrs) in train_dataloader:
 
         current_epoch += 1
         num_batches += batch_size
@@ -168,7 +166,7 @@ def train_predictor(
 
 
 def ray_tune_predictor(
-    num_gpus: float = 0.5,
+    num_gpus: float = 0.25,
 ):
 
     def _ray_tune_predictor(config: dict):

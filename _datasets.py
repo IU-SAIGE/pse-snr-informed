@@ -146,8 +146,7 @@ class Mixtures(IterableDataset):
         mixture_set: Optional[str] = None,
         mixture_snr: Optional[Union[float, Tuple[float, float]]] = None,
         dataset_duration: Optional[float] = None,
-        utterance_duration: float = 1.,
-        target_snrs: bool = False,
+        utterance_duration: float = 1.
     ):
         # parse and sanity check arguments
         self.sanity_check(locals())
@@ -247,11 +246,6 @@ class Mixtures(IterableDataset):
         self.premixture_set = args['premixture_set'] or ''
         self.mixture_set = args['mixture_set'] or ''
 
-        # verify target specification
-        if not isinstance(args['target_snrs'], bool):
-            raise ValueError('Expected `target_snrs` to be True or False.')
-        self.target_snrs = args['target_snrs']
-
         # verify utterance duration
         if not isinstance(args['utterance_duration'], (int, float)):
             raise ValueError('Expected `utterance_duration` to be a number.')
@@ -298,7 +292,7 @@ class Mixtures(IterableDataset):
         n: np.ndarray = np.zeros(length)
         if len(self.df_n) > 0:
             self.n_idx = (self.n_idx + 1) % len(self.df_n)
-            offset_n = max(1, self.df_m.max_offset.iloc[self.n_idx])
+            offset_n = max(1, self.df_n.max_offset.iloc[self.n_idx])
             offset_n = self.rng.integers(0, offset_n)
             (_, n) = wavfile.read(self.df_n.filepath.iloc[self.n_idx])
             n = n[offset_n:offset_n+length]
@@ -308,19 +302,12 @@ class Mixtures(IterableDataset):
             x = p + (n * 10 ** (-snr / 20.))
 
         # create output tuple
-        sample = ()
-        scale_factor = EPS + max(abs(x.min()), abs(x.max()))
-        if self.target_snrs:
-            sample = (
-                torch.Tensor(x) / scale_factor,     # noise-injected premixture
-                torch.Tensor(segmental_snr(x, s)),  # frame-by-frame SNRs
-            )
-        else:
-            sample = (
-                torch.Tensor(x) / scale_factor,  # noise-injected premixture
-                torch.Tensor(p) / scale_factor,  # premixture (or clean speech)
-            )
-        return sample
+        scale_factor = EPS + np.abs(x).max()
+        return (
+            torch.Tensor(x) / scale_factor,     # mixture signal
+            torch.Tensor(p) / scale_factor,     # premixture signal
+            torch.Tensor(segmental_snr(x, s)),  # frame-by-frame SNRs
+        )
 
     # end of class
 
