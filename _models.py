@@ -10,7 +10,7 @@ from asteroid.models.conv_tasnet import ConvTasNet
 from torch.nn.modules.loss import _Loss
 
 
-EPS = 1e-30
+EPS = 1e-8
 
 
 class PredictorGRU(nn.Module):
@@ -242,7 +242,13 @@ class SegSDRLoss(_Loss):
         self.hop_length = hop_length
         self.center = center
         self.pad_mode = pad_mode
-        self.window = torch.hann_window(self.segment_size).view(1, 1, -1)
+
+        device = 'cpu'
+        if torch.cuda.is_available():
+            device = 'cuda:0'
+
+        self.window = torch.hann_window(self.segment_size)
+        self.window = self.window.view(1, 1, -1).to(device)
 
     def forward(self, estimate, target, weights=None):
         assert target.size() == estimate.size()
@@ -277,15 +283,8 @@ class SegSDRLoss(_Loss):
             stride=(n_samples, self.hop_length, 1))
 
         # window all the frames
-        target *= self.window
-        estimate *= self.window
-
-        # apply weighting (if provided)
-        if weights is not None:
-            assert weights.numel() == n_frames
-            weights = weights.view(1, -1, 1)
-            target *= weights
-            estimate *= weights
+        target = torch.multiply(target, self.window)
+        estimate = torch.multiply(estimate, self.window)
 
         # collapse batch and time axes
         target = target.reshape(-1, self.segment_size)
@@ -309,6 +308,13 @@ class SegSDRLoss(_Loss):
         losses = losses / (torch.sum(e_noise ** 2, dim=1) + EPS)
         losses = 10 * torch.log10(losses + EPS)
         losses = losses.view(n_batch, -1)
+
+        # apply weighting (if provided)
+        if weights is not None:
+            assert losses.size() == weights.size()
+            weights = weights.detach() # ensures backprop doesn't modify predictor
+            losses = torch.multiply(losses, weights)
+
         losses = losses.mean() if self.reduction == 'mean' else losses
 
         return -losses
