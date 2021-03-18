@@ -8,6 +8,9 @@ from scipy.io import wavfile
 from torch.utils.data import IterableDataset
 
 
+EPS = 1e-8
+
+
 max_duration: int = 3  # seconds
 sample_rate: int = 16000  # Hz
 
@@ -18,8 +21,6 @@ _df_types = dict(
     is_sparse=bool, set_id=str, speaker_id=str, utterance_id=str,
     freesound_id=str,
 )
-
-EPS = 1e-30
 
 
 def create_df_librispeech(
@@ -102,8 +103,8 @@ def create_df_fsd50k(
     return df
 
 
-def logistic(v, alpha: float = 1., beta: float = 1.):
-    return (1 / (1 + alpha * np.exp(-beta*v)))
+def logistic(v, beta: float = 1.):
+    return (1 / (1 + torch.exp(-beta * v)))
 
 
 def segmental_snr(
